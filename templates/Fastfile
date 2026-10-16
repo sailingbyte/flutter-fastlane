@@ -1,12 +1,12 @@
 # Copy to <app>/fastlane/Fastfile. Pull the shared lanes from the shared repo.
 #
-# CI:    FASTLANE_SHARED_URL=https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.example.com/my-group/fastlane-shared.git
-# Local: FASTLANE_SHARED_PATH=/path/to/checkout/of/fastlane-shared   (edit the shared lanes without pushing)
+# CI:    nothing to set - pulls https://github.com/sailingbyte/flutter-fastlane.git (override with FASTLANE_SHARED_URL)
+# Local: FASTLANE_SHARED_PATH=/path/to/checkout/of/flutter-fastlane   (edit the shared lanes without pushing)
 
 if ENV["FASTLANE_SHARED_PATH"].to_s.empty?
   import_from_git(
-    url: ENV.fetch("FASTLANE_SHARED_URL"),
-    branch: ENV.fetch("FASTLANE_SHARED_REF", "main"), # pin to a tag (e.g. v1) once stable
+    url: ENV.fetch("FASTLANE_SHARED_URL", "https://github.com/sailingbyte/flutter-fastlane.git"),
+    branch: ENV.fetch("FASTLANE_SHARED_REF", "master"), # pin to a tag (e.g. v1) once stable
     path: "fastlane/Fastfile"
   )
 else
