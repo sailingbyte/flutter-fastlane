@@ -1,4 +1,4 @@
-# fastlane-shared
+# flutter-fastlane
 
 One Fastfile + GitLab CI template that builds, tests and ships any Flutter app to Google Play and
 App Store Connect. Apps contribute only a few lines of config; secrets live in CI.
@@ -7,14 +7,14 @@ App Store Connect. Apps contribute only a few lines of config; secrets live in C
 
 1. Copy `templates/Fastfile` → `<app>/fastlane/Fastfile`
 2. Copy `templates/env.default` → `<app>/fastlane/.env.default` and fill in package/bundle ids
-3. Add a `Gemfile` with `gem "fastlane"` (+ `bundle lock`)
+3. Nothing to install: the CI template runs `gem install fastlane` (version pinned by `FASTLANE_VERSION`), so no Gemfile
 4. Android: make `android/app/build.gradle.kts` read signing config from env (see the rotat-flutter example)
 5. Include the CI template in `.gitlab-ci.yml` (see header of `ci/flutter-fastlane.gitlab-ci.yml`)
 6. Set `FASTLANE_SHARED_URL` and the secrets below in GitLab
 7. Integration tests / screenshots: copy `templates/integration_test/*` (`test_driver_integration_test.dart` → `test_driver/integration_test.dart`), add `integration_test: {sdk: flutter}` to `dev_dependencies`
 
 Local run against an unpushed checkout of this repo:
-`FASTLANE_SHARED_PATH=../fastlane-shared bundle exec fastlane test`
+`FASTLANE_SHARED_PATH=../flutter-fastlane fastlane test` (needs `gem install fastlane`)
 
 ## Pipeline flow
 
@@ -90,8 +90,7 @@ everything is rotatable.
 
 | Variable | Value |
 |---|---|
-| `ANDROID_KEYSTORE_PATH` | GitLab **File** variable containing the upload keystore (preferred), *or* |
-| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 upload-keystore.jks` |
+| `ANDROID_KEYSTORE_BASE64` | the keystore, base64 (GitLab File variables only hold text). PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("upload-keystore.jks")) \| Set-Clipboard`; bash: `base64 -w0 upload-keystore.jks` |
 | `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | keystore secrets |
 | `SUPPLY_JSON_KEY` | **File** variable: Google Cloud service-account JSON (or `SUPPLY_JSON_KEY_DATA` raw JSON) |
 
@@ -111,7 +110,7 @@ everything is rotatable.
 | `MATCH_GIT_BASIC_AUTHORIZATION` | `base64 "user:read-only-token"` — a deploy/access token with **read** scope |
 
 * [`fastlane match`](https://docs.fastlane.tools/actions/match/) keeps the distribution certificate and
-  profiles encrypted (AES) in a private repo. Create them **once on a Mac**: `bundle exec fastlane match appstore`
+  profiles encrypted (AES) in a private repo. Create them **once on a Mac**: `fastlane match appstore`
   (list every bundle id, including extensions). CI runs it `readonly`, so a compromised pipeline cannot
   mint new certificates.
 * The API key avoids Apple ID passwords/2FA on CI. `setup_ci` uses a throw-away keychain per job.
@@ -125,10 +124,56 @@ everything is rotatable.
 | `SLACK_URL` | Slack incoming-webhook URL (Masked) |
 | `CI_PUSH_TOKEN` | project access token (Developer+, `write_repository`) used to commit fastlane output back |
 | `E2E_*` | anything the app's integration tests need (e.g. test credentials); app-defined names, forwarded as `--dart-define` |
-| `FASTLANE_SHARED_URL` | `https://gitlab-ci-token:${CI_JOB_TOKEN}@<gitlab-host>/<group>/fastlane-shared.git` — allow the app in this repo's *Settings → CI/CD → Job token permissions* |
+| `FASTLANE_SHARED_URL` | only if you fork/mirror this repo (default `https://github.com/sailingbyte/flutter-fastlane.git`) |
 
 Put variables shared by all apps (`SLACK_URL`, `MATCH_*`, `APP_STORE_CONNECT_*`, `FASTLANE_SHARED_URL`) at the
 **GitLab group** level and per-app ones (keystore, Play JSON, `DOTENV_FILE`) on the project. For stronger
 isolation later, move to GitLab's HashiCorp Vault / OIDC integration instead of static variables.
 
 Never `echo` these variables in jobs, and don't enable `CI_DEBUG_TRACE`.
+
+## Trying it: Android beta (step by step)
+
+Prerequisite: the app already exists on Google Play with at least one release uploaded by hand.
+
+**1. Play service account** (once)
+Google Cloud Console → IAM → Service accounts → create → Keys → add JSON key. Play Console → Users and
+permissions → invite the service account email → give the app *Release to testing tracks*
+(+ *Release to production* for `main`). Enable the *Google Play Android Developer API* in that Cloud project.
+
+**2. Add the GitLab CI/CD variables** (project → Settings → CI/CD → Variables). Never commit these.
+
+| Variable | Type | Flags | Value |
+|---|---|---|---|
+| `SUPPLY_JSON_KEY` | File | Protected* | contents of the service-account JSON |
+| `ANDROID_KEYSTORE_BASE64` | Variable | Masked, Protected* | base64 of the upload keystore |
+| `ANDROID_KEYSTORE_PASSWORD` | Variable | Masked, Protected* | keystore password |
+| `ANDROID_KEY_ALIAS` | Variable | Protected* | key alias |
+| `ANDROID_KEY_PASSWORD` | Variable | Masked, Protected* | key password (omit if same as keystore) |
+| `DOTENV_FILE` | File | Protected* | contents of the app's runtime `.env` |
+| `FASTLANE_COMMIT_CHANGES` | Variable | | `false` for now |
+| `PLAY_VALIDATE_ONLY` | Variable | | `true` for the first run (dry run) |
+| `SLACK_URL` | Variable | Masked, Protected* | optional - Slack incoming webhook URL |
+
+\* *Protected* variables are only exposed to protected branches. Either mark `test/*` as a protected branch
+(Settings → Repository → Protected branches) or leave Protected off while testing.
+
+**3. Pipeline file** — the app's `.gitlab-ci.yml` includes this repo's template and sets `IOS_ENABLED: "false"`.
+
+**4. Push a `test/*` branch** (e.g. `test/2.0.8`). Jobs: `fastlane:test`, then `fastlane:android:beta`.
+It needs a Docker runner that can pull `ghcr.io/cirruslabs/flutter` and run untagged jobs.
+
+**5. Dry run passes → real upload.** Delete `PLAY_VALIDATE_ONLY`; the next push uploads to the internal testing
+track and posts to Slack.
+
+**6. Commit-back** (optional, later): create a project access token (role Developer, scope `write_repository`),
+store it as `CI_PUSH_TOKEN`, and delete `FASTLANE_COMMIT_CHANGES=false`. Needs `test/*`/`main` to allow pushes by it.
+
+Local dry run (WSL/Mac, `gem install fastlane`): export the same variables, then
+`PLAY_VALIDATE_ONLY=true FASTLANE_COMMIT_CHANGES=false fastlane android beta`.
+
+## Using this repo
+
+Nothing in here is secret. Apps pull the Fastfile with `import_from_git` (default
+`https://github.com/sailingbyte/flutter-fastlane.git`, branch `master`; pin with `FASTLANE_SHARED_REF`) and
+include the CI template via `remote:` (see the header of `ci/flutter-fastlane.gitlab-ci.yml`).
