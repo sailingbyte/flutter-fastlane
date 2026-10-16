@@ -1,0 +1,116 @@
+# Shared GitLab CI jobs for Flutter apps built with the shared Fastfile.
+#
+# In the app's .gitlab-ci.yml:
+#
+#   include:
+#     - project: my-group/fastlane-shared      # or `local: fastlane-shared/ci/...` while it lives in the app repo
+#       ref: v1
+#       file: ci/flutter-fastlane.gitlab-ci.yml
+#
+#   stages: [test, deploy]
+#   variables:
+#     FLUTTER_VERSION: "3.47.0"
+#
+# Flow
+#   MR, test/*, main, main/*  -> fastlane test
+#   test/*                    -> beta    (Play internal testing + TestFlight)
+#   main, main/*              -> release (Play production + App Store)
+#
+# Changelog: hand-written fastlane/changelogs/<version>.txt (required for release jobs).
+# Version from the branch name (optional): test/2.1.0, main/2.1.0, test/2.1.0+215
+# Per-build changelog copies, screenshots and reports are committed back to the branch with
+# `[skip ci]` (needs the CI_PUSH_TOKEN variable, see README).
+#
+# Toggle per app with ANDROID_ENABLED / IOS_ENABLED = "false".
+# Secrets: see README.md ("Secrets"). Mark them Protected + Masked (or File).
+
+variables:
+  FLUTTER_VERSION: "stable"
+  FASTLANE_SKIP_UPDATE_CHECK: "1"
+  FASTLANE_HIDE_CHANGELOG: "1"
+  LC_ALL: "en_US.UTF-8"
+  LANG: "en_US.UTF-8"
+  GIT_DEPTH: "0"
+  FASTLANE_COMMIT_CHANGES: "true" # commit fastlane/{metadata,screenshots,reports} back to the branch
+
+.test_branch: &test_branch
+  if: '$CI_COMMIT_BRANCH =~ /^test\//'
+
+.main_branch: &main_branch
+  if: '$CI_COMMIT_BRANCH =~ /^main(\/.*)?$/'
+
+# --- Linux runner: tests + Android ------------------------------------------
+.fastlane_linux:
+  image: ghcr.io/cirruslabs/flutter:${FLUTTER_VERSION}
+  variables:
+    BUNDLE_PATH: vendor/bundle
+  cache:
+    key: "fastlane-linux-$CI_PROJECT_ID"
+    paths:
+      - vendor/bundle
+      - .pub-cache
+  before_script:
+    - export PUB_CACHE="$CI_PROJECT_DIR/.pub-cache"
+    # The Flutter image has no Ruby. Bake your own image to skip this step.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ruby-full build-essential
+    - gem install bundler --no-document
+    - bundle install --jobs 4 --quiet
+
+# --- macOS runner (shell executor, tag `macos`): iOS ---------------------------
+# Needs Xcode, Flutter, Ruby + Bundler preinstalled on the runner.
+.fastlane_macos:
+  tags: [macos]
+  variables:
+    BUNDLE_PATH: vendor/bundle
+  before_script:
+    - bundle install --jobs 4 --quiet
+
+fastlane:test:
+  extends: .fastlane_linux
+  stage: test
+  script:
+    - bundle exec fastlane test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - <<: *test_branch
+    - <<: *main_branch
+
+fastlane:android:beta:
+  extends: .fastlane_linux
+  stage: deploy
+  script:
+    - bundle exec fastlane android beta
+  rules:
+    - if: '$ANDROID_ENABLED == "false"'
+      when: never
+    - <<: *test_branch
+
+fastlane:android:release:
+  extends: .fastlane_linux
+  stage: deploy
+  script:
+    - bundle exec fastlane android release
+  rules:
+    - if: '$ANDROID_ENABLED == "false"'
+      when: never
+    - <<: *main_branch
+
+fastlane:ios:beta:
+  extends: .fastlane_macos
+  stage: deploy
+  script:
+    - bundle exec fastlane ios beta
+  rules:
+    - if: '$IOS_ENABLED == "false"'
+      when: never
+    - <<: *test_branch
+
+fastlane:ios:release:
+  extends: .fastlane_macos
+  stage: deploy
+  script:
+    - bundle exec fastlane ios release
+  rules:
+    - if: '$IOS_ENABLED == "false"'
+      when: never
+    - <<: *main_branch

@@ -1,0 +1,692 @@
+# frozen_string_literal: true
+
+# =============================================================================
+# Shared Fastfile for Flutter apps (Android + iOS).
+#
+# Everything fastlane produces (changelogs, screenshots, release reports) is
+# written under the app's fastlane/ dir and committed back by CI, so git
+# history shows what shipped in which version.
+#
+# Imported by each app's own (3-line) fastlane/Fastfile via `import_from_git`.
+# Everything app specific comes from environment variables: committed,
+# non-secret values live in the app's `fastlane/.env.default`; secrets are
+# injected by CI. See README.md in this repo for the full variable reference.
+#
+# Lanes
+#   fastlane test                  analyze + unit tests
+#   fastlane android beta          build AAB -> Play (internal track by default)
+#   fastlane android release       build AAB -> Play (production, draft by default)
+#   fastlane android screenshots   capture store screenshots (SCREENSHOTS_ENABLED=true)
+#   fastlane ios beta              build IPA -> TestFlight
+#   fastlane ios release           build IPA -> App Store Connect
+#   fastlane ios screenshots       capture store screenshots (SCREENSHOTS_ENABLED=true)
+# =============================================================================
+
+require "json"
+require "base64"
+require "tmpdir"
+require "fileutils"
+require "shellwords"
+
+fastlane_version "2.220.0"
+skip_docs
+
+# ----------------------------------------------------------------------------
+# Generic helpers
+# ----------------------------------------------------------------------------
+
+def env_present?(name)
+  !ENV[name].to_s.strip.empty?
+end
+
+def env_true?(name, default = false)
+  return default unless env_present?(name)
+
+  %w[1 true yes on].include?(ENV[name].strip.downcase)
+end
+
+def env!(name)
+  UI.user_error!("Missing required environment variable #{name}") unless env_present?(name)
+  ENV[name].strip
+end
+
+def project_root
+  File.expand_path("..", FastlaneCore::FastlaneFolder.path)
+end
+
+def app_name
+  env_present?("APP_NAME") ? ENV["APP_NAME"] : File.basename(project_root)
+end
+
+def flutter(*args)
+  sh(%(cd #{project_root.shellescape} && flutter #{args.shelljoin}))
+end
+
+def git_out(*args)
+  sh(%(git -C #{project_root.shellescape} #{args.shelljoin}), log: false).to_s.strip
+end
+
+# Writes a secret supplied as base64 env var to a private temp file.
+def write_secret_file(base64_value, filename)
+  dir = Dir.mktmpdir("fastlane-secret")
+  path = File.join(dir, filename)
+  File.binwrite(path, Base64.decode64(base64_value))
+  File.chmod(0o600, path)
+  at_exit { FileUtils.rm_rf(dir) }
+  path
+end
+
+# ----------------------------------------------------------------------------
+# Flutter project preparation
+# ----------------------------------------------------------------------------
+
+# pubspec.yaml: `version: 2.0.7+207` -> ["2.0.7", 207]
+def pubspec_version
+  match = File.read(File.join(project_root, "pubspec.yaml"))
+              .match(/^version:\s*(\d+\.\d+\.\d+)(?:\+(\d+))?/)
+  UI.user_error!("Could not read `version:` from pubspec.yaml") unless match
+  [match[1], (match[2] || "1").to_i]
+end
+
+def branch_name
+  return ENV["CI_COMMIT_REF_NAME"] if env_present?("CI_COMMIT_REF_NAME")
+
+  git_out("rev-parse", "--abbrev-ref", "HEAD")
+end
+
+# Branches like `main/2.1.0`, `test/2.1.0` or `test/2.1.0+215` carry the
+# release version (and optionally the build number): [name or nil, build or nil]
+def branch_version
+  match = branch_name.match(%r{/v?(\d+\.\d+\.\d+)(?:\+(\d+))?\z})
+  match ? [match[1], match[2]&.to_i] : [nil, nil]
+end
+
+# Version name: branch (`main/2.1.0`) > pubspec.yaml
+def release_version_name
+  branch_version[0] || pubspec_version[0]
+end
+
+# Build number: BUILD_NUMBER env > branch (`test/2.1.0+215`) >
+# max(pubspec build, latest on store + 1), so CI never collides with
+# manually uploaded builds.
+def resolve_build_number(store_latest)
+  return ENV["BUILD_NUMBER"].to_i if env_present?("BUILD_NUMBER")
+  return branch_version[1] if branch_version[1]
+
+  [pubspec_version[1], store_latest.to_i + 1].max
+end
+
+# --dart-define flags for every E2E_* env var (test credentials etc.), so
+# integration tests can read them with String.fromEnvironment.
+def e2e_dart_defines
+  ENV.select { |k, v| k.start_with?("E2E_") && !v.to_s.empty? }.map { |k, v| "--dart-define=#{k}=#{v}" }
+end
+
+def fastlane_dir
+  FastlaneCore::FastlaneFolder.path
+end
+
+def metadata_dir(platform)
+  File.join(fastlane_dir, "metadata", platform.to_s)
+end
+
+def screenshots_dir(platform)
+  File.join(fastlane_dir, "screenshots", platform.to_s)
+end
+
+# The app bundles `.env` as an asset and it is not in git. CI provides it
+# either as a GitLab "File" variable (DOTENV_FILE = path) or base64 (DOTENV_BASE64).
+def prepare_dotenv
+  target = File.join(project_root, ".env")
+  if env_present?("DOTENV_FILE")
+    FileUtils.cp(ENV["DOTENV_FILE"], target)
+  elsif env_present?("DOTENV_BASE64")
+    File.binwrite(target, Base64.decode64(ENV["DOTENV_BASE64"]))
+  elsif !File.exist?(target)
+    UI.important("No .env found and DOTENV_FILE/DOTENV_BASE64 not set - the app may fail at runtime")
+  end
+end
+
+def prepare_flutter
+  prepare_dotenv
+  flutter("pub", "get")
+end
+
+# ----------------------------------------------------------------------------
+# Changelog
+# ----------------------------------------------------------------------------
+
+# Changelogs are written by hand, never generated from commits.
+# Source of truth (tracked in git): fastlane/changelogs/<versionName>.txt
+# e.g. fastlane/changelogs/2.1.0.txt - plain text, shown to users as-is.
+#
+#   required: true  (release lanes) -> missing/empty file fails the job before any build starts
+#   required: false (beta lanes)    -> falls back to BETA_CHANGELOG_FALLBACK
+# CHANGELOG env var overrides the file for a one-off run.
+# Too long for the store -> fails (never silently truncated).
+def load_changelog(version_name, max_length, required:)
+  file = File.join(fastlane_dir, "changelogs", "#{version_name}.txt")
+  text =
+    if env_present?("CHANGELOG")
+      ENV["CHANGELOG"].strip
+    elsif File.exist?(file)
+      File.read(file).strip
+    else
+      ""
+    end
+
+  if text.empty?
+    UI.user_error!("Missing changelog: write #{file}") if required
+
+    text = ENV.fetch("BETA_CHANGELOG_FALLBACK", "Test build")
+  end
+  if text.length > max_length
+    UI.user_error!("Changelog for #{version_name} is #{text.length} chars, store limit is #{max_length} (#{file})")
+  end
+  text
+end
+
+# ----------------------------------------------------------------------------
+# Slack
+# ----------------------------------------------------------------------------
+
+def notify_slack(success:, title:, info: {}, error: nil)
+  return unless env_present?("SLACK_URL")
+
+  fields = []
+  fields << { title: "Version", value: "#{info[:version]} (#{info[:build]})", short: true } if info[:version]
+  fields << { title: "Track", value: info[:track].to_s, short: true } if info[:track]
+  fields << { title: "Changelog", value: info[:changelog].to_s, short: false } if info[:changelog] && success
+  fields << { title: "Error", value: error.to_s[0, 500], short: false } if error
+  fields << { title: "Job", value: ENV["CI_JOB_URL"], short: false } if env_present?("CI_JOB_URL")
+  fields << { title: "Ref", value: ENV["CI_COMMIT_REF_NAME"], short: true } if env_present?("CI_COMMIT_REF_NAME")
+
+  slack(
+    slack_url: ENV["SLACK_URL"],
+    channel: ENV["SLACK_CHANNEL"],
+    message: "#{success ? '✅' : '❌'} #{title} #{success ? 'deployed' : 'FAILED'}",
+    success: success,
+    default_payloads: [],
+    attachment_properties: { fields: fields },
+    fail_on_error: false
+  )
+rescue StandardError => e
+  UI.important("Slack notification failed: #{e.message}")
+end
+
+# Runs the block, reports the outcome to Slack and re-raises failures so the
+# CI job still fails.
+def with_slack(title)
+  info = yield
+  notify_slack(success: true, title: title, info: info || {})
+  info
+rescue StandardError => e
+  notify_slack(success: false, title: title, error: e.message)
+  raise
+end
+
+# ----------------------------------------------------------------------------
+# Screenshots
+#
+# The app owns the screenshot flow: integration_test/screenshots_test.dart,
+# driven by test_driver/integration_test.dart (templates in this repo). The
+# driver writes PNGs to $SCREENSHOT_DIR.
+#
+#   SCREENSHOT_IOS_DEVICES      "iPhone 16 Pro Max,iPad Pro 13-inch (M4)"  (simulator names)
+#   SCREENSHOT_ANDROID_DEVICES  "emulator-5554:phoneScreenshots,emulator-5556:tenInchScreenshots"
+#                               (adb serial : Play folder; emulators must already be running)
+# ----------------------------------------------------------------------------
+
+def screenshots_enabled?
+  env_true?("SCREENSHOTS_ENABLED")
+end
+
+def screenshot_locale
+  ENV.fetch("SCREENSHOT_LOCALE", "en-US")
+end
+
+def slugify(text)
+  text.gsub(/[^A-Za-z0-9]+/, "_").gsub(/\A_|_\z/, "")
+end
+
+def ios_simulator_udid(name)
+  data = JSON.parse(sh("xcrun simctl list devices available -j", log: false))
+  match = data["devices"].sort.flat_map { |_runtime, devs| devs }.select { |d| d["name"] == name }.last
+  UI.user_error!("iOS simulator '#{name}' not found (xcrun simctl list devices)") unless match
+  match["udid"]
+end
+
+# Returns [{ label:, slug:, id:, kind: }]
+def screenshot_devices(platform)
+  if platform == :ios
+    env!("SCREENSHOT_IOS_DEVICES").split(",").map(&:strip).reject(&:empty?).map do |name|
+      { label: name, slug: slugify(name), id: ios_simulator_udid(name), kind: nil }
+    end
+  else
+    env!("SCREENSHOT_ANDROID_DEVICES").split(",").map(&:strip).reject(&:empty?).map do |entry|
+      serial, _sep, kind = entry.rpartition(":")
+      serial, kind = entry, "phoneScreenshots" if serial.empty?
+      { label: serial, slug: slugify(serial), id: serial, kind: kind }
+    end
+  end
+end
+
+# Runs the integration_test driver on every configured device.
+# Returns [{ label:, slug:, id:, kind:, files: [...] }] (files live in a temp dir).
+def capture_screenshots(platform)
+  base = Dir.mktmpdir("flutter-screenshots")
+  at_exit { FileUtils.rm_rf(base) }
+  target = ENV.fetch("SCREENSHOT_TARGET", "integration_test/screenshots_test.dart")
+
+  screenshot_devices(platform).map do |device|
+    out = File.join(base, device[:slug])
+    FileUtils.mkdir_p(out)
+
+    if platform == :ios
+      sh("xcrun simctl bootstatus #{device[:id].shellescape} -b", log: false)
+      sh("xcrun simctl status_bar #{device[:id].shellescape} override --time 9:41 --batteryState charged " \
+         "--batteryLevel 100 --cellularBars 4 --wifiBars 3", log: false) { |_status, _res| nil }
+    end
+
+    ENV["SCREENSHOT_DIR"] = out
+    ENV["SCREENSHOT_DEVICE"] = device[:label]
+    flutter("drive", "--driver=test_driver/integration_test.dart", "--target=#{target}", "-d", device[:id],
+            *e2e_dart_defines)
+
+    files = Dir.glob(File.join(out, "*.png")).sort
+    UI.user_error!("No screenshots produced on #{device[:label]}") if files.empty?
+
+    sh("xcrun simctl shutdown #{device[:id].shellescape}", log: false) { |_s, _r| nil } if platform == :ios
+    device.merge(files: files)
+  end
+end
+
+# Replaces the screenshots tracked in git with the freshly captured ones:
+#   android -> fastlane/metadata/android/<locale>/images/<kind>/  (supply layout)
+#   ios     -> fastlane/screenshots/ios/<locale>/                 (deliver layout)
+def store_screenshots(platform, results)
+  locale = screenshot_locale
+  if platform == :ios
+    dest = File.join(screenshots_dir(:ios), locale)
+    FileUtils.rm_rf(dest)
+    FileUtils.mkdir_p(dest)
+    results.each do |device|
+      device[:files].each { |f| FileUtils.cp(f, File.join(dest, "#{device[:slug]}-#{File.basename(f)}")) }
+    end
+  else
+    results.map { |d| d[:kind] }.uniq.each do |kind|
+      FileUtils.rm_rf(File.join(metadata_dir(:android), locale, "images", kind))
+    end
+    results.each do |device|
+      dest = File.join(metadata_dir(:android), locale, "images", device[:kind])
+      FileUtils.mkdir_p(dest)
+      FileUtils.cp(device[:files], dest)
+    end
+  end
+end
+
+# ----------------------------------------------------------------------------
+# Release bookkeeping (kept in git)
+# ----------------------------------------------------------------------------
+
+# fastlane/reports/<platform>-<version>+<build>.md
+def write_release_report(platform, info)
+  dir = File.join(fastlane_dir, "reports")
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, "#{platform}-#{info[:version]}+#{info[:build]}.md"), <<~MD)
+    # #{app_name} #{platform} #{info[:version]} (#{info[:build]})
+
+    - Track: #{info[:track]}
+    - Date: #{Time.now.utc.strftime('%Y-%m-%d %H:%M UTC')}
+    - Branch: #{branch_name}
+    - Commit: #{git_out('rev-parse', 'HEAD')}
+    - Pipeline: #{ENV.fetch('CI_PIPELINE_URL', 'local')}
+    - Screenshots: #{info[:screenshots] ? 'updated' : 'unchanged'}
+
+    ## Changelog
+
+    #{info[:changelog]}
+  MD
+end
+
+# CI only (FASTLANE_COMMIT_CHANGES=true): commits fastlane/{metadata,screenshots,reports}
+# back to the branch. Needs CI_PUSH_TOKEN (project access token, write_repository).
+# `[skip ci]` prevents a pipeline loop.
+def commit_fastlane_changes(message)
+  return unless env_true?("FASTLANE_COMMIT_CHANGES")
+
+  env!("CI_PUSH_TOKEN")
+  branch = env!("CI_COMMIT_REF_NAME")
+  # Left unexpanded here on purpose: the shell expands the token, so it never appears in fastlane's logs/errors.
+  remote = '"https://oauth2:${CI_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"'
+  git = "git -C #{project_root.shellescape}"
+
+  sh("#{git} config user.name \"${GITLAB_USER_NAME:-fastlane}\" && " \
+     "#{git} config user.email \"${GITLAB_USER_EMAIL:-fastlane@localhost}\"", log: false)
+  sh("#{git} checkout -B #{branch.shellescape}", log: false)
+  sh("#{git} add fastlane/metadata fastlane/screenshots fastlane/reports", log: false)
+  return if system("#{git} diff --cached --quiet")
+
+  sh("#{git} commit -m #{"#{message} [skip ci]".shellescape}", log: false)
+  3.times do |attempt|
+    # The Android and iOS jobs may push at the same time - rebase and retry.
+    sh("#{git} fetch #{remote} #{branch.shellescape} && #{git} rebase FETCH_HEAD && " \
+       "#{git} push #{remote} HEAD:refs/heads/#{branch.shellescape}", log: false)
+    break
+  rescue StandardError => e
+    raise if attempt == 2
+
+    UI.important("Push failed (#{e.class}), retrying...")
+    sleep(3 * (attempt + 1))
+  end
+end
+
+def finalize_release(platform, info)
+  write_release_report(platform, info)
+  commit_fastlane_changes("fastlane: #{app_name} #{platform} #{info[:version]} (#{info[:build]}) #{info[:track]}")
+rescue StandardError => e
+  UI.important("Could not record release in git: #{e.message}")
+end
+
+# ----------------------------------------------------------------------------
+# Android
+# ----------------------------------------------------------------------------
+
+# android/app/build.gradle.kts reads ANDROID_KEYSTORE_PATH, ANDROID_KEYSTORE_PASSWORD,
+# ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD (falls back to android/key.properties locally).
+# Keystore comes from a CI "File" variable (ANDROID_KEYSTORE_PATH) or base64.
+def prepare_android_signing
+  if !env_present?("ANDROID_KEYSTORE_PATH") && env_present?("ANDROID_KEYSTORE_BASE64")
+    ENV["ANDROID_KEYSTORE_PATH"] = write_secret_file(ENV["ANDROID_KEYSTORE_BASE64"], "upload-keystore.jks")
+  end
+
+  return if !env_present?("ANDROID_KEYSTORE_PATH") && File.exist?(File.join(project_root, "android", "key.properties"))
+
+  UI.user_error!("Keystore not found at #{ENV['ANDROID_KEYSTORE_PATH']}") unless File.exist?(env!("ANDROID_KEYSTORE_PATH"))
+  env!("ANDROID_KEYSTORE_PASSWORD")
+  env!("ANDROID_KEY_ALIAS")
+end
+
+def android_latest_version_code
+  codes = %w[internal alpha beta production].flat_map do |track|
+    google_play_track_version_codes(package_name: env!("ANDROID_PACKAGE_NAME"), track: track)
+  rescue StandardError
+    []
+  end
+  codes.max.to_i
+end
+
+def android_build_aab(version_name, build_number)
+  flutter("build", "appbundle", "--release", "--build-name", version_name, "--build-number", build_number.to_s)
+  aab = File.join(project_root, "build/app/outputs/bundle/release/app-release.aab")
+  UI.user_error!("AAB not found at #{aab}") unless File.exist?(aab)
+  aab
+end
+
+# Release lanes always upload to production automatically. Sending the release to
+# store review is the manual step unless the flag is on:
+#   SUBMIT_FOR_REVIEW=true (both stores), or ANDROID_SUBMIT_FOR_REVIEW / IOS_SUBMIT_FOR_REVIEW per platform.
+# Play: off = release stays a draft in the console, on = rolled out (goes to review).
+# Note: an app's very first Play release must be a draft regardless.
+def submit_for_review?(platform)
+  env_true?("#{platform.to_s.upcase}_SUBMIT_FOR_REVIEW", env_true?("SUBMIT_FOR_REVIEW"))
+end
+
+def android_deploy(track:, release_status:, with_screenshots:, changelog_required:)
+  prepare_flutter
+  prepare_android_signing
+
+  version_name = release_version_name
+  build_number = resolve_build_number(android_latest_version_code)
+  changelog = load_changelog(version_name, 500, required: changelog_required) # Play limit per language
+  aab = android_build_aab(version_name, build_number)
+
+  # Play's layout, tracked in git: fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt
+  # (a hand-written default.txt in the same folder is Play's fallback for builds without a file).
+  changelog_dir = File.join(metadata_dir(:android), screenshot_locale, "changelogs")
+  FileUtils.mkdir_p(changelog_dir)
+  File.write(File.join(changelog_dir, "#{build_number}.txt"), changelog)
+
+  store_screenshots(:android, capture_screenshots(:android)) if with_screenshots
+
+  # Credentials: SUPPLY_JSON_KEY (file path) or SUPPLY_JSON_KEY_DATA (raw JSON) are read by supply.
+  upload_to_play_store(
+    package_name: env!("ANDROID_PACKAGE_NAME"),
+    track: track,
+    aab: aab,
+    release_status: release_status,
+    metadata_path: metadata_dir(:android),
+    skip_upload_metadata: true,
+    skip_upload_images: true,
+    skip_upload_screenshots: !with_screenshots,
+    skip_upload_changelogs: false,
+    validate_only: env_true?("PLAY_VALIDATE_ONLY") # dry run: Play validates the upload, nothing is saved
+  )
+
+  info = { version: version_name, build: build_number, track: track, changelog: changelog,
+           screenshots: with_screenshots }
+  finalize_release(:android, info)
+  info
+end
+
+# ----------------------------------------------------------------------------
+# iOS
+# ----------------------------------------------------------------------------
+
+# IOS_TARGETS="Runner:com.acme.app,NotificationExt:com.acme.app.NotificationExt"
+# First entry is the main app. Every target that is archived needs a profile.
+def ios_targets
+  env!("IOS_TARGETS").split(",").map { |pair| pair.strip.split(":", 2) }.tap do |pairs|
+    UI.user_error!("IOS_TARGETS must look like 'Target:bundle.id,Target2:bundle.id2'") if pairs.any? { |p| p.length != 2 }
+  end
+end
+
+def ios_xcodeproj
+  File.join(project_root, ENV.fetch("IOS_XCODEPROJ", "ios/Runner.xcodeproj"))
+end
+
+def ios_workspace
+  File.join(project_root, ENV.fetch("IOS_WORKSPACE", "ios/Runner.xcworkspace"))
+end
+
+def ios_scheme
+  ENV.fetch("IOS_SCHEME", "Runner")
+end
+
+def ios_api_key
+  app_store_connect_api_key(
+    key_id: env!("APP_STORE_CONNECT_API_KEY_ID"),
+    issuer_id: env!("APP_STORE_CONNECT_API_ISSUER_ID"),
+    key_content: env!("APP_STORE_CONNECT_API_KEY_CONTENT"), # base64 of the .p8 file
+    is_key_content_base64: true,
+    in_house: false
+  )
+end
+
+def ios_latest_build_number(api_key)
+  latest_testflight_build_number(api_key: api_key, app_identifier: ios_targets.first[1], initial_build_number: 0)
+rescue StandardError => e
+  UI.important("Could not read latest TestFlight build number: #{e.message}")
+  0
+end
+
+# Fetches distribution certs/profiles via match (read-only on CI) and switches
+# the Xcode project to manual signing with them. Runs on the CI checkout only.
+def ios_sign(api_key)
+  setup_ci if env_present?("CI") # temporary keychain, so nothing touches the runner's login keychain
+
+  match(
+    type: "appstore",
+    app_identifier: ios_targets.map(&:last),
+    readonly: env_present?("CI") || env_true?("MATCH_READONLY"),
+    api_key: api_key
+  )
+  mapping = lane_context[SharedValues::MATCH_PROVISIONING_PROFILE_MAPPING]
+
+  ios_targets.each do |target, bundle_id|
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: ios_xcodeproj,
+      targets: [target],
+      team_id: env!("FASTLANE_TEAM_ID"),
+      code_sign_identity: "Apple Distribution",
+      profile_name: mapping.fetch(bundle_id),
+      bundle_identifier: bundle_id,
+      build_configurations: ["Release"]
+    )
+  end
+  mapping
+end
+
+def ios_build_ipa(version_name, build_number, api_key)
+  flutter("build", "ios", "--release", "--no-codesign", "--build-name", version_name, "--build-number", build_number.to_s)
+  mapping = ios_sign(api_key)
+
+  build_app(
+    workspace: ios_workspace,
+    scheme: ios_scheme,
+    configuration: "Release",
+    export_method: "app-store",
+    export_options: { provisioningProfiles: mapping },
+    output_directory: File.join(project_root, "build/ios/ipa"),
+    output_name: "#{ios_scheme}.ipa",
+    clean: false
+  )
+  lane_context[SharedValues::IPA_OUTPUT_PATH]
+end
+
+def ios_prepare_release
+  prepare_flutter
+  api_key = ios_api_key
+  version_name = release_version_name
+  build_number = resolve_build_number(ios_latest_build_number(api_key))
+  [api_key, version_name, build_number]
+end
+
+def ios_beta
+  api_key, version_name, build_number = ios_prepare_release
+  changelog = load_changelog(version_name, 4000, required: false)
+  ipa = ios_build_ipa(version_name, build_number, api_key)
+
+  # TestFlight only applies `changelog` once processing finished, so waiting is the default.
+  upload_to_testflight(
+    ipa: ipa,
+    api_key: api_key,
+    changelog: changelog,
+    skip_waiting_for_build_processing: !env_true?("IOS_WAIT_FOR_PROCESSING", true),
+    distribute_external: false,
+    uses_non_exempt_encryption: false
+  )
+
+  info = { version: version_name, build: build_number, track: "TestFlight", changelog: changelog }
+  finalize_release(:ios, info)
+  info
+end
+
+def ios_release(with_screenshots:)
+  api_key, version_name, build_number = ios_prepare_release
+  changelog = load_changelog(version_name, 4000, required: true)
+  ipa = ios_build_ipa(version_name, build_number, api_key)
+
+  # Tracked in git: fastlane/metadata/ios/<locale>/release_notes.txt (deliver layout)
+  notes_dir = File.join(metadata_dir(:ios), screenshot_locale)
+  FileUtils.mkdir_p(notes_dir)
+  File.write(File.join(notes_dir, "release_notes.txt"), changelog)
+
+  store_screenshots(:ios, capture_screenshots(:ios)) if with_screenshots
+
+  upload_to_app_store(
+    ipa: ipa,
+    api_key: api_key,
+    metadata_path: metadata_dir(:ios),
+    screenshots_path: screenshots_dir(:ios),
+    skip_metadata: false,
+    skip_screenshots: !with_screenshots,
+    overwrite_screenshots: true,
+    submit_for_review: submit_for_review?(:ios),
+    automatic_release: env_true?("IOS_AUTOMATIC_RELEASE"),
+    force: true, # no interactive HTML preview on CI
+    run_precheck_before_submit: false,
+    precheck_include_in_app_purchases: false
+  )
+
+  info = { version: version_name, build: build_number, track: "App Store", changelog: changelog,
+           screenshots: with_screenshots }
+  finalize_release(:ios, info)
+  info
+end
+
+# ----------------------------------------------------------------------------
+# Lanes
+# ----------------------------------------------------------------------------
+
+desc "Static analysis and unit tests"
+lane :test do
+  prepare_flutter
+  flutter("analyze")
+  if Dir.exist?(File.join(project_root, "test"))
+    flutter("test", "--coverage")
+  else
+    UI.important("No test/ directory - skipping `flutter test`")
+  end
+end
+
+platform :android do
+  desc "Build and upload to the Play beta track (default: internal)"
+  lane :beta do
+    with_slack("#{app_name} Android") do
+      android_deploy(
+        track: ENV.fetch("ANDROID_BETA_TRACK", "internal"),
+        release_status: "completed",
+        with_screenshots: false,
+        changelog_required: false
+      )
+    end
+  end
+
+  desc "Build and upload to Play production (draft unless SUBMIT_FOR_REVIEW=true)"
+  lane :release do
+    with_slack("#{app_name} Android") do
+      android_deploy(
+        track: ENV.fetch("ANDROID_RELEASE_TRACK", "production"),
+        release_status: submit_for_review?(:android) ? "completed" : "draft",
+        with_screenshots: screenshots_enabled?,
+        changelog_required: true
+      )
+    end
+  end
+
+  desc "Capture store screenshots only (needs SCREENSHOTS_ENABLED=true)"
+  lane :screenshots do
+    if screenshots_enabled?
+      prepare_flutter
+      store_screenshots(:android, capture_screenshots(:android))
+      commit_fastlane_changes("fastlane: #{app_name} android screenshots")
+    else
+      UI.important("SCREENSHOTS_ENABLED is not true - skipping")
+    end
+  end
+end
+
+platform :ios do
+  desc "Build and upload to TestFlight"
+  lane :beta do
+    with_slack("#{app_name} iOS") { ios_beta }
+  end
+
+  desc "Build and upload to App Store Connect (optionally submit for review)"
+  lane :release do
+    with_slack("#{app_name} iOS") { ios_release(with_screenshots: screenshots_enabled?) }
+  end
+
+  desc "Capture store screenshots only (needs SCREENSHOTS_ENABLED=true)"
+  lane :screenshots do
+    if screenshots_enabled?
+      prepare_flutter
+      store_screenshots(:ios, capture_screenshots(:ios))
+      commit_fastlane_changes("fastlane: #{app_name} ios screenshots")
+    else
+      UI.important("SCREENSHOTS_ENABLED is not true - skipping")
+    end
+  end
+end
