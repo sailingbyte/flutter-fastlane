@@ -3,12 +3,11 @@
 # In the app's .gitlab-ci.yml:
 #
 #   include:
-#     - project: my-group/fastlane-shared      # or `local: fastlane-shared/ci/...` while it lives in the app repo
-#       ref: v1
-#       file: ci/flutter-fastlane.gitlab-ci.yml
+#     - remote: https://raw.githubusercontent.com/sailingbyte/flutter-fastlane/master/ci/flutter-fastlane.gitlab-ci.yml
 #
 #   stages: [test, deploy]
 #   variables:
+#     FASTLANE_SHARED_REF: master   # same ref as in the include URL
 #     FLUTTER_VERSION: "3.47.0"
 #
 # Flow
@@ -26,6 +25,7 @@
 
 variables:
   FLUTTER_VERSION: "stable"
+  FASTLANE_VERSION: "2.228.0" # installed on every run, so apps need no Gemfile
   FASTLANE_SKIP_UPDATE_CHECK: "1"
   FASTLANE_HIDE_CHANGELOG: "1"
   LC_ALL: "en_US.UTF-8"
@@ -43,33 +43,34 @@ variables:
 .fastlane_linux:
   image: ghcr.io/cirruslabs/flutter:${FLUTTER_VERSION}
   variables:
-    BUNDLE_PATH: vendor/bundle
+    GEM_HOME: "$CI_PROJECT_DIR/.gem"
   cache:
-    key: "fastlane-linux-$CI_PROJECT_ID"
+    key: "fastlane-linux-$CI_PROJECT_ID-$FASTLANE_VERSION"
     paths:
-      - vendor/bundle
+      - .gem
       - .pub-cache
   before_script:
     - export PUB_CACHE="$CI_PROJECT_DIR/.pub-cache"
+    - export PATH="$GEM_HOME/bin:$PATH"
     # The Flutter image has no Ruby. Bake your own image to skip this step.
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends ruby-full build-essential
-    - gem install bundler --no-document
-    - bundle install --jobs 4 --quiet
+    - gem install fastlane -v "$FASTLANE_VERSION" --no-document
 
 # --- macOS runner (shell executor, tag `macos`): iOS ---------------------------
 # Needs Xcode, Flutter, Ruby + Bundler preinstalled on the runner.
 .fastlane_macos:
   tags: [macos]
   variables:
-    BUNDLE_PATH: vendor/bundle
+    GEM_HOME: "$CI_PROJECT_DIR/.gem"
   before_script:
-    - bundle install --jobs 4 --quiet
+    - export PATH="$GEM_HOME/bin:$PATH"
+    - gem install fastlane -v "$FASTLANE_VERSION" --no-document
 
 fastlane:test:
   extends: .fastlane_linux
   stage: test
   script:
-    - bundle exec fastlane test
+    - fastlane test
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - <<: *test_branch
@@ -79,7 +80,7 @@ fastlane:android:beta:
   extends: .fastlane_linux
   stage: deploy
   script:
-    - bundle exec fastlane android beta
+    - fastlane android beta
   rules:
     - if: '$ANDROID_ENABLED == "false"'
       when: never
@@ -89,7 +90,7 @@ fastlane:android:release:
   extends: .fastlane_linux
   stage: deploy
   script:
-    - bundle exec fastlane android release
+    - fastlane android release
   rules:
     - if: '$ANDROID_ENABLED == "false"'
       when: never
@@ -99,7 +100,7 @@ fastlane:ios:beta:
   extends: .fastlane_macos
   stage: deploy
   script:
-    - bundle exec fastlane ios beta
+    - fastlane ios beta
   rules:
     - if: '$IOS_ENABLED == "false"'
       when: never
@@ -109,7 +110,7 @@ fastlane:ios:release:
   extends: .fastlane_macos
   stage: deploy
   script:
-    - bundle exec fastlane ios release
+    - fastlane ios release
   rules:
     - if: '$IOS_ENABLED == "false"'
       when: never
