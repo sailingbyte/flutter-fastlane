@@ -24,7 +24,12 @@
 # Secrets: see README.md ("Secrets"). Mark them Protected + Masked (or File).
 
 variables:
-  FLUTTER_VERSION: "stable"
+  # Exact Flutter release to build with (e.g. "3.47.0"). Empty = whatever the Docker image ships.
+  FLUTTER_VERSION: ""
+  # Tag of ghcr.io/cirruslabs/flutter, which is only the base image (Android SDK, JDK, Flutter).
+  # It lags behind new Flutter releases, so FLUTTER_VERSION is switched to officially from
+  # github.com/flutter/flutter inside the job.
+  FLUTTER_IMAGE_TAG: "stable"
   FASTLANE_VERSION: "2.228.0" # installed on every run, so apps need no Gemfile
   FASTLANE_SKIP_UPDATE_CHECK: "1"
   FASTLANE_HIDE_CHANGELOG: "1"
@@ -41,7 +46,7 @@ variables:
 
 # --- Linux runner: tests + Android ------------------------------------------
 .fastlane_linux:
-  image: ghcr.io/cirruslabs/flutter:${FLUTTER_VERSION}
+  image: ghcr.io/cirruslabs/flutter:${FLUTTER_IMAGE_TAG}
   variables:
     GEM_HOME: "$CI_PROJECT_DIR/.gem"
   cache:
@@ -52,6 +57,14 @@ variables:
   before_script:
     - export PUB_CACHE="$CI_PROJECT_DIR/.pub-cache"
     - export PATH="$GEM_HOME/bin:$PATH"
+    - |
+      if [ -n "$FLUTTER_VERSION" ] && ! flutter --version 2>/dev/null | grep -q "^Flutter $FLUTTER_VERSION "; then
+        FLUTTER_DIR="$(dirname "$(dirname "$(readlink -f "$(which flutter)")")")"
+        git config --global --add safe.directory "$FLUTTER_DIR"
+        git -C "$FLUTTER_DIR" fetch --depth 1 https://github.com/flutter/flutter.git "refs/tags/$FLUTTER_VERSION:refs/tags/$FLUTTER_VERSION"
+        git -C "$FLUTTER_DIR" checkout -f "$FLUTTER_VERSION"
+      fi
+    - flutter --version
     # The Flutter image has no Ruby. Bake your own image to skip this step.
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends ruby-full build-essential
     - gem install fastlane -v "$FASTLANE_VERSION" --no-document
